@@ -1,0 +1,11 @@
+node_modules
+dist
+__pycache__
+*.pyc
+vector_db/
+sessions/*.json
+*.egg-info
+.env
+.DS_Store
+# 知识文档保留在版本控制中（删除上面那行）
+# backend/knowledge_docs/
