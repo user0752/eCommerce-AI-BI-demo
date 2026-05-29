@@ -40,6 +40,11 @@ SERVICE_NAMES = {
 
 class ServiceLauncher:
     def __init__(self, root):
+        """初始化启动管理器
+
+        设置窗口属性、服务状态字典，构建界面，并启动初始检测与自动检测循环。
+        root 为 tkinter 根窗口实例。
+        """
         self.root = root
         self.root.title("黔数智析 - 启动管理器")
         self.root.geometry("980x760")
@@ -69,6 +74,10 @@ class ServiceLauncher:
         self.root.after(AUTO_CHECK_INTERVAL * 1000, self._auto_check_loop)
 
     def setup_ui(self):
+        """构建主界面
+
+        依次创建标题栏、服务状态卡片、控制按钮区域和日志输出区域。
+        """
         title_frame = tk.Frame(self.root, bg='#1890ff', height=90)
         title_frame.pack(fill='x')
         title_frame.pack_propagate(False)
@@ -95,6 +104,11 @@ class ServiceLauncher:
         self._build_log_area(main)
 
     def _build_status_cards(self, parent):
+        """构建服务状态卡片
+
+        在 parent 容器中创建四张服务状态卡片（MySQL、Ollama、后端、前端），
+        每张卡片包含图标、标题、副标题和状态标签。
+        """
         frame = tk.Frame(parent, bg='#f0f2f5')
         frame.pack(fill='x', pady=(0, 15))
 
@@ -135,33 +149,59 @@ class ServiceLauncher:
             }
 
     def _update_card(self, key, text, bg_color, fg_color, icon):
+        """更新状态卡片显示
+
+        根据 key 定位卡片，更新状态文本、背景色、前景色和图标。
+        """
         card = self.status_cards[key]
         card['status'].config(text=text, bg=bg_color, fg=fg_color)
         card['icon'].config(text=icon)
 
     def _set_card_starting(self, key):
+        """将指定服务的状态卡片切换为「启动中」
+
+        同时将 service_starting 标记为 True。
+        """
         self.service_starting[key] = True
         self._update_card(key, '⏳ 启动中…', '#faad14', 'white', '🟡')
 
     def _set_card_stopping(self, key):
+        """将指定服务的状态卡片切换为「停止中」"""
         self._update_card(key, '⏳ 停止中…', '#d9d9d9', '#666', '⚪')
 
     def _set_card_running(self, key):
+        """将指定服务的状态卡片切换为「运行中」
+
+        同时将 service_running 标记为 True，service_starting 标记为 False。
+        """
         self.service_running[key] = True
         self.service_starting[key] = False
         self._update_card(key, '✅ 运行中', '#52c41a', 'white', '🟢')
 
     def _set_card_stopped(self, key):
+        """将指定服务的状态卡片切换为「未启动」
+
+        同时将 service_running 和 service_starting 均标记为 False。
+        """
         self.service_running[key] = False
         self.service_starting[key] = False
         self._update_card(key, '⏸ 未启动', '#faad14', 'white', '⚪')
 
     def _set_card_error(self, key, text='❌ 异常'):
+        """将指定服务的状态卡片切换为「异常」
+
+        text 为显示的异常文本，默认为「❌ 异常」。
+        同时将 service_running 和 service_starting 均标记为 False。
+        """
         self.service_running[key] = False
         self.service_starting[key] = False
         self._update_card(key, text, '#ff4d4f', 'white', '🔴')
 
     def _build_control_buttons(self, parent):
+        """构建控制按钮区域
+
+        包含一键启动、停止全部、打开前端页面、重新检测按钮和自动检测复选框。
+        """
         frame = tk.Frame(parent, bg='#f0f2f5')
         frame.pack(fill='x', pady=(0, 15))
 
@@ -212,6 +252,11 @@ class ServiceLauncher:
         auto_cb.pack(side='right')
 
     def _build_log_area(self, parent):
+        """构建日志输出区域
+
+        包含日志标题栏（清空、导出按钮）和可滚动的日志文本框，
+        文本框支持 info/success/warning/error/step 五种颜色标签。
+        """
         frame = tk.Frame(parent, bg='#f0f2f5')
         frame.pack(fill='both', expand=True)
 
@@ -246,6 +291,11 @@ class ServiceLauncher:
         self.log_text.tag_config('step',    foreground='#69b1ff')
 
     def log(self, message, tag='info'):
+        """输出日志
+
+        在日志文本框中追加带时间戳的日志消息，tag 控制颜色（info/success/warning/error/step）。
+        超过 MAX_LOG_LINES + 50 行时自动裁剪旧日志。
+        """
         ts = datetime.now().strftime('%H:%M:%S')
         self.log_text.insert(tk.END, f"[{ts}] {message}\n", tag)
         line_count = int(self.log_text.index('end-1c').split('.')[0])
@@ -254,10 +304,15 @@ class ServiceLauncher:
         self.log_text.see(tk.END)
 
     def _clear_log(self):
+        """清空日志文本框"""
         self.log_text.delete('1.0', tk.END)
         self.log("日志已清空", 'info')
 
     def _export_log(self):
+        """导出日志到文件
+
+        弹出文件保存对话框，将日志文本框内容写入用户指定的 .log 文件。
+        """
         filepath = filedialog.asksaveasfilename(
             defaultextension='.log',
             filetypes=[('日志文件', '*.log'), ('文本文件', '*.txt')],
@@ -272,6 +327,10 @@ class ServiceLauncher:
                 self.log(f"导出失败: {e}", 'error')
 
     def _toggle_auto_check(self):
+        """切换自动检测开关
+
+        根据复选框状态启用或禁用自动检测，并输出相应日志。
+        """
         self._auto_check_enabled = self.auto_check_var.get()
         if self._auto_check_enabled:
             self.log(f"自动检测已开启（每{AUTO_CHECK_INTERVAL}秒）", 'info')
@@ -279,11 +338,20 @@ class ServiceLauncher:
             self.log("自动检测已关闭", 'warning')
 
     def _auto_check_loop(self):
+        """自动检测循环
+
+        每隔 AUTO_CHECK_INTERVAL 秒触发一次静默检测，通过 root.after 实现非阻塞定时。
+        """
         if self._auto_check_enabled:
             threading.Thread(target=self._do_silent_check, daemon=True).start()
         self.root.after(AUTO_CHECK_INTERVAL * 1000, self._auto_check_loop)
 
     def _do_silent_check(self):
+        """静默检测服务状态
+
+        在后台线程中检测所有服务，若有任何服务状态变化则输出提示日志。
+        有服务正在启动时跳过本次检测。
+        """
         any_starting = any(self.service_starting.values())
         if any_starting:
             return
@@ -301,9 +369,17 @@ class ServiceLauncher:
             self.log("🔄 服务状态已变化，已自动刷新", 'info')
 
     def _initial_check(self):
+        """初始检测
+
+        在后台线程中执行首次服务状态检测，完成后启用启动按钮。
+        """
         threading.Thread(target=self._do_initial_check, daemon=True).start()
 
     def _do_initial_check(self):
+        """执行初始检测
+
+        依次检测 MySQL、Ollama、后端、前端服务状态，检测完成后启用启动按钮。
+        """
         self.log("正在检测服务状态…", 'info')
         self._check_mysql()
         self._check_ollama()
@@ -312,9 +388,17 @@ class ServiceLauncher:
         self.start_btn.config(state='normal')
 
     def check_all_services(self):
+        """手动检测所有服务
+
+        在后台线程中执行全量服务状态检测。
+        """
         threading.Thread(target=self._do_check_all, daemon=True).start()
 
     def _do_check_all(self):
+        """执行手动检测
+
+        依次检测 MySQL、Ollama、后端、前端服务状态并更新卡片。
+        """
         self.log("正在检测服务状态…", 'info')
         self._check_mysql()
         self._check_ollama()
@@ -322,6 +406,11 @@ class ServiceLauncher:
         self._check_frontend()
 
     def _check_ollama(self):
+        """检测 Ollama 服务状态
+
+        通过 HTTP 请求 /api/tags 接口判断 Ollama 是否就绪，
+        成功则标记为运行中，否则标记为未启动。
+        """
         try:
             import urllib.request
             req = urllib.request.Request(
@@ -339,6 +428,11 @@ class ServiceLauncher:
         self.log("Ollama 服务未运行，点击「一键启动」可自动启动", 'warning')
 
     def _check_mysql(self):
+        """检测 MySQL 服务状态
+
+        通过 TCP 连接 MySQL 端口判断服务是否就绪，
+        成功则标记为运行中，否则标记为异常。
+        """
         try:
             import socket
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -355,6 +449,11 @@ class ServiceLauncher:
         self.log("MySQL 服务未运行，请先启动 MySQL 服务", 'error')
 
     def _check_backend(self):
+        """检测后端服务状态
+
+        通过 HTTP 请求 /api/status 接口判断 Flask 后端是否就绪，
+        成功则标记为运行中，否则标记为未启动。
+        """
         try:
             import urllib.request
             req = urllib.request.Request(
@@ -371,6 +470,11 @@ class ServiceLauncher:
         self._set_card_stopped('backend')
 
     def _check_frontend(self):
+        """检测前端服务状态
+
+        通过 HTTP 请求前端端口判断 Vue 前端是否就绪，
+        成功则标记为运行中，否则标记为未启动。
+        """
         try:
             import urllib.request
             req = urllib.request.Request(
@@ -387,6 +491,11 @@ class ServiceLauncher:
         self._set_card_stopped('frontend')
 
     def _check_ollama_model(self):
+        """检查 Ollama 模型是否已安装
+
+        查询 /api/tags 接口，检查是否包含 qwen3:8b 模型。
+        返回 True 表示模型已就绪，False 表示未找到或检测失败。
+        """
         try:
             import urllib.request
             req = urllib.request.Request(
@@ -407,6 +516,11 @@ class ServiceLauncher:
             return False
 
     def start_all_services(self):
+        """一键启动全部服务
+
+        前置检查 MySQL 是否就绪，若未就绪则弹窗提示并中止。
+        启动前会清理已占用端口的旧进程，随后在后台线程中按顺序启动各服务。
+        """
         self.log("=" * 60, 'info')
         self.log("开始按顺序启动所有服务…", 'info')
 
@@ -428,6 +542,11 @@ class ServiceLauncher:
         threading.Thread(target=self._start_sequential, daemon=True).start()
 
     def _start_sequential(self):
+        """按顺序启动服务
+
+        依次启动 MySQL（检测）、Ollama、后端、前端，每步输出进度提示。
+        MySQL 未就绪时中止后续启动。
+        """
         total = 4
         step = 0
 
@@ -479,6 +598,11 @@ class ServiceLauncher:
         self._auto_check_enabled = self.auto_check_var.get()
 
     def _start_ollama(self):
+        """启动 Ollama 服务
+
+        查找 ollama 可执行文件并以 serve 模式启动子进程，
+        最多等待 20 秒确认服务就绪，超时则标记为启动失败。
+        """
         try:
             self.log("🤖 正在启动 Ollama 服务…", 'info')
             ollama_exe = self._find_ollama()
@@ -512,9 +636,15 @@ class ServiceLauncher:
             self._set_card_error('ollama', '❌ 启动失败')
 
     def _find_ollama(self):
-        hardcoded = r'C:\Users\86175\AppData\Local\Programs\Ollama\ollama.exe'
-        if os.path.isfile(hardcoded):
-            return hardcoded
+        """查找 Ollama 可执行文件路径
+
+        查找顺序：
+          1. LOCALAPPDATA 环境变量下的标准安装路径
+          2. 系统 PATH 中的 ollama 命令（where/which）
+
+        Returns:
+            str or None: 找到的 ollama 可执行文件路径
+        """
         candidates = [
             os.path.join(os.environ.get('LOCALAPPDATA', ''),
                          'Programs', 'Ollama', 'ollama.exe'),
@@ -534,6 +664,11 @@ class ServiceLauncher:
         return None
 
     def _start_backend(self):
+        """启动后端服务
+
+        检查 Python 依赖后以子进程启动 Flask 后端，将输出重定向到日志文件和界面，
+        最多等待 60 秒确认服务就绪。
+        """
         try:
             self.log("📡 正在启动 Flask 后端服务…", 'info')
             self._check_python_deps()
@@ -583,6 +718,11 @@ class ServiceLauncher:
             self.start_btn.config(state='normal')
 
     def _start_frontend(self):
+        """启动前端服务
+
+        首次运行时自动安装 npm 依赖，以子进程启动 Vite 开发服务器，
+        将输出重定向到日志文件和界面，最多等待 60 秒确认服务就绪。
+        """
         try:
             self.log("🎨 正在启动 Vue 前端服务…", 'info')
 
@@ -653,6 +793,12 @@ class ServiceLauncher:
             self.start_btn.config(state='normal')
 
     def _drain_output(self, proc, prefix, log_file=None):
+        """消费子进程输出
+
+        在后台线程中持续读取子进程 stdout，将每行输出到界面日志和可选的日志文件。
+        proc 为子进程对象，prefix 为日志前缀标识，log_file 为可选的日志文件句柄。
+        子进程异常退出时输出错误提示。
+        """
         try:
             for line in proc.stdout:
                 stripped = line.rstrip()
@@ -678,6 +824,10 @@ class ServiceLauncher:
                 pass
 
     def _check_python_deps(self):
+        """检查 Python 依赖
+
+        读取后端 requirements.txt 并以 pip install -r 静默安装缺失的依赖包。
+        """
         try:
             requirements = os.path.join(BACKEND_DIR, 'requirements.txt')
             if not os.path.isfile(requirements):
@@ -695,6 +845,11 @@ class ServiceLauncher:
             self.log(f"⚠️ Python 依赖检查失败: {e}", 'warning')
 
     def _kill_port(self, port, name):
+        """终止占用指定端口的进程
+
+        通过 netstat 查找监听指定端口的 PID，然后 taskkill 强制终止。
+        port 为端口号，name 为服务名称（用于日志提示）。仅在 Windows 上有效。
+        """
         try:
             result = subprocess.run(
                 ['netstat', '-ano'],
@@ -719,6 +874,11 @@ class ServiceLauncher:
             self.log(f"  清理端口 {port} 失败: {e}", 'error')
 
     def stop_all_services(self):
+        """停止所有服务
+
+        按逆序停止前端、后端、Ollama 服务（跳过 MySQL），
+        清理进程引用并恢复按钮状态。
+        """
         self.log("⏹ 正在停止所有服务…", 'warning')
         self._auto_check_enabled = False
 
@@ -741,6 +901,11 @@ class ServiceLauncher:
         self._auto_check_enabled = self.auto_check_var.get()
 
     def _terminate_process(self, card_key, proc, name):
+        """终止指定进程
+
+        card_key 为状态卡片键名，proc 为子进程对象，name 为服务名称（用于日志提示）。
+        Windows 下使用 taskkill /F /T 强制终止进程树，其他平台使用 terminate()。
+        """
         if proc and proc.poll() is None:
             try:
                 if IS_WINDOWS:
@@ -762,6 +927,10 @@ class ServiceLauncher:
             self._set_card_stopped(card_key)
 
     def open_frontend(self):
+        """打开前端页面
+
+        在浏览器中打开前端页面。若后端未就绪则弹窗确认是否继续。
+        """
         if not self.service_running.get('backend'):
             result = messagebox.askyesno(
                 "提示",
@@ -776,6 +945,10 @@ class ServiceLauncher:
         self.log(f"🌐 正在打开 {url}", 'info')
 
     def on_closing(self):
+        """窗口关闭处理
+
+        弹窗确认退出，确认后停止所有服务并销毁窗口。
+        """
         if messagebox.askokcancel("退出", "确定要退出吗？\n所有正在运行的服务将被停止。"):
             self.stop_all_services()
             self.root.destroy()

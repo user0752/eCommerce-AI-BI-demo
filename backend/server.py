@@ -12,6 +12,7 @@ import json
 import os
 import re
 import uuid
+from contextlib import closing
 from datetime import datetime
 from flask import Flask, request, jsonify, Response, session
 from flask_cors import CORS
@@ -48,27 +49,188 @@ def _get_log_connection():
     return pymysql.connect(**MYSQL_CONFIG, cursorclass=pymysql.cursors.DictCursor, charset='utf8mb4')
 
 
+def _format_sse_event(event_type, content=None):
+    """将事件类型和内容格式化为SSE data帧
+
+    Args:
+        event_type: 事件类型（thinking_start/thinking_content/thinking_end/content/error）
+        content: 事件内容，thinking_start和thinking_end类型时为None
+
+    Returns:
+        str: 格式化后的SSE data帧字符串
+    """
+    event_data = {"type": event_type}
+    if content is not None:
+        event_data["content"] = content
+    return f"data: {json.dumps(event_data, ensure_ascii=False)}\n\n"
+
+
+def _resolve_response_status(intent_value):
+    """根据意图类型确定响应状态（用于审计日志）"""
+    if intent_value == "out_of_domain":
+        return "fallback"
+    if intent_value == "clarify":
+        return "clarify"
+    return "success"
+
+
+def _execute_dashboard_query(sql, params=None):
+    """执行大屏数据查询并自动序列化浮点数
+
+    Args:
+        sql: SQL查询语句
+        params: SQL参数元组，无参数时为None
+
+    Returns:
+        list[dict] or dict: 查询结果（多行为列表，单行为字典）
+    """
+    with closing(_get_log_connection()) as conn:
+        with closing(conn.cursor()) as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+            for row in rows:
+                for col_key, col_val in row.items():
+                    if hasattr(col_val, '__float__'):
+                        row[col_key] = round(float(col_val), 2)
+    return rows
+
+
+def _generate_captcha_text(length=4):
+    """生成验证码文本
+
+    Args:
+        length: 验证码字符长度，默认4
+
+    Returns:
+        str: 大写字母+数字组成的随机验证码
+    """
+    import random
+    import string
+    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
+
+
+def _render_captcha_image(captcha_text):
+    """将验证码文本渲染为PNG图片的base64编码
+
+    Args:
+        captcha_text: 验证码文本
+
+    Returns:
+        str: data:image/png;base64,... 格式的图片URI
+    """
+    import random
+    from io import BytesIO
+    from PIL import Image, ImageDraw, ImageFont
+    import base64
+
+    width, height = 120, 40
+    image = Image.new('RGB', (width, height), (17, 29, 50))
+    draw = ImageDraw.Draw(image)
+
+    try:
+        font = ImageFont.truetype("arial.ttf", 28)
+    except Exception:
+        font = ImageFont.load_default()
+
+    for idx, char in enumerate(captcha_text):
+        x = 10 + idx * 26
+        y = random.randint(2, 8)
+        color = (
+            random.randint(100, 255),
+            random.randint(150, 255),
+            random.randint(200, 255)
+        )
+        draw.text((x, y), char, font=font, fill=color)
+
+    for _ in range(3):
+        x1 = random.randint(0, width)
+        y1 = random.randint(0, height)
+        x2 = random.randint(0, width)
+        y2 = random.randint(0, height)
+        draw.line([(x1, y1), (x2, y2)], fill=(60, 80, 120), width=1)
+
+    for _ in range(30):
+        px = random.randint(0, width)
+        py = random.randint(0, height)
+        draw.point((px, py), fill=(80, 100, 140))
+
+    buffer = BytesIO()
+    image.save(buffer, format='PNG')
+    buffer.seek(0)
+    captcha_base64 = base64.b64encode(buffer.read()).decode('utf-8')
+    return f'data:image/png;base64,{captcha_base64}'
+
+
+def _query_status_distribution(cur):
+    """查询各状态的查询总数分布"""
+    cur.execute(f"SELECT status, COUNT(*) as cnt FROM `{AUDIT_LOG_TABLE}` GROUP BY status")
+    return {row['status']: row['cnt'] for row in cur.fetchall()}
+
+
+def _query_today_stats(cur):
+    """查询今日各状态的查询数分布"""
+    cur.execute(
+        f"SELECT status, COUNT(*) as cnt FROM `{AUDIT_LOG_TABLE}` WHERE DATE(created_at) = CURDATE() GROUP BY status"
+    )
+    return {row['status']: row['cnt'] for row in cur.fetchall()}
+
+
+def _query_top_fallback(cur, limit=10):
+    """查询兜底率最高的Top N问题"""
+    cur.execute(
+        f"SELECT query_text, COUNT(*) as cnt FROM `{AUDIT_LOG_TABLE}` WHERE status = 'fallback' GROUP BY query_text ORDER BY cnt DESC LIMIT %s",
+        (limit,)
+    )
+    rows = cur.fetchall()
+    for item in rows:
+        item['query_text'] = item['query_text'][:100] if item['query_text'] else ''
+    return rows
+
+
+def _query_top_clarify(cur, limit=10):
+    """查询澄清率最高的Top N问题"""
+    cur.execute(
+        f"SELECT query_text, COUNT(*) as cnt FROM `{AUDIT_LOG_TABLE}` WHERE status = 'clarify' GROUP BY query_text ORDER BY cnt DESC LIMIT %s",
+        (limit,)
+    )
+    rows = cur.fetchall()
+    for item in rows:
+        item['query_text'] = item['query_text'][:100] if item['query_text'] else ''
+    return rows
+
+
+def _query_weekly_trend(cur):
+    """查询近7天的查询趋势（按日期+状态分组）"""
+    cur.execute(f"""
+        SELECT DATE(created_at) as date, status, COUNT(*) as cnt
+        FROM `{AUDIT_LOG_TABLE}` WHERE created_at >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)
+        GROUP BY DATE(created_at), status ORDER BY date
+    """)
+    rows = cur.fetchall()
+    for item in rows:
+        if item.get('date'):
+            item['date'] = item['date'].strftime('%Y-%m-%d')
+    return rows
+
+
 def _ensure_audit_table():
     """确保审计日志表存在"""
     try:
-        conn = _get_log_connection()
-        cur = conn.cursor()
-        # 表名来自固定常量，非用户输入，安全
-        cur.execute(f"""
-            CREATE TABLE IF NOT EXISTS `{AUDIT_LOG_TABLE}` (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                query_text TEXT CHARACTER SET utf8mb4,
-                intent VARCHAR(50),
-                tool_used VARCHAR(50),
-                status VARCHAR(20) COMMENT 'success / fallback / clarify',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                INDEX idx_status (status),
-                INDEX idx_created_at (created_at)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-        """)
-        conn.commit()
-        cur.close()
-        conn.close()
+        with closing(_get_log_connection()) as conn:
+            with closing(conn.cursor()) as cur:
+                cur.execute(f"""
+                    CREATE TABLE IF NOT EXISTS `{AUDIT_LOG_TABLE}` (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        query_text TEXT CHARACTER SET utf8mb4,
+                        intent VARCHAR(50),
+                        tool_used VARCHAR(50),
+                        status VARCHAR(20) COMMENT 'success / fallback / clarify',
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        INDEX idx_status (status),
+                        INDEX idx_created_at (created_at)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """)
+                conn.commit()
         print(f"审计日志表 {AUDIT_LOG_TABLE} 已就绪")
     except Exception as e:
         print(f"创建审计日志表失败（非阻塞）: {e}")
@@ -82,15 +244,13 @@ def _write_audit_log(question, intent_value, status):
             tool_used = "clarify"
             status = "clarify"
 
-        conn = _get_log_connection()
-        cur = conn.cursor()
-        cur.execute(
-            f"INSERT INTO `{AUDIT_LOG_TABLE}` (query_text, intent, tool_used, status) VALUES (%s, %s, %s, %s)",
-            (question, intent_value, tool_used, status)
-        )
-        conn.commit()
-        cur.close()
-        conn.close()
+        with closing(_get_log_connection()) as conn:
+            with closing(conn.cursor()) as cur:
+                cur.execute(
+                    f"INSERT INTO `{AUDIT_LOG_TABLE}` (query_text, intent, tool_used, status) VALUES (%s, %s, %s, %s)",
+                    (question, intent_value, tool_used, status)
+                )
+                conn.commit()
     except Exception:
         pass  # 日志写入失败不应阻塞主流程
 
@@ -161,45 +321,22 @@ def stream_chat():
 
             for chunk in chatbot.stream_ask(question, pre_parsed=parse_result):
                 if chunk == "__THINKING_START__":
-                    event = json.dumps({"type": "thinking_start"}, ensure_ascii=False)
-                    yield f"data: {event}\n\n"
-
+                    yield _format_sse_event("thinking_start")
                 elif chunk.startswith("__THINKING_CONTENT__"):
                     thinking_content = chunk.replace("__THINKING_CONTENT__", "")
-                    event = json.dumps({
-                        "type": "thinking_content",
-                        "content": thinking_content
-                    }, ensure_ascii=False)
-                    yield f"data: {event}\n\n"
-
+                    yield _format_sse_event("thinking_content", thinking_content)
                 elif chunk == "__THINKING_END__":
-                    event = json.dumps({"type": "thinking_end"}, ensure_ascii=False)
-                    yield f"data: {event}\n\n"
-
+                    yield _format_sse_event("thinking_end")
                 else:
-                    event = json.dumps({
-                        "type": "content",
-                        "content": chunk
-                    }, ensure_ascii=False)
-                    yield f"data: {event}\n\n"
+                    yield _format_sse_event("content", chunk)
 
-            # 确定最终状态
-            if intent_value == "out_of_domain":
-                response_status = "fallback"
-            elif intent_value == "clarify":
-                response_status = "clarify"
+            response_status = _resolve_response_status(intent_value)
 
         except Exception as e:
-            # 🔥 脱敏：不暴露堆栈和内部细节给前端
             print(f"流式对话错误: {e}")
-            event = json.dumps({
-                "type": "error",
-                "content": "服务器处理请求时出错，请稍后重试。"
-            }, ensure_ascii=False)
-            yield f"data: {event}\n\n"
+            yield _format_sse_event("error", "服务器处理请求时出错，请稍后重试。")
             response_status = "fallback"
 
-        # 审计日志（在 finally 之前写入）
         _write_audit_log(question, intent_value, response_status)
         yield "data: [DONE]\n\n"
 
@@ -424,58 +561,16 @@ def register():
 
 @app.route('/api/auth/captcha', methods=['GET'])
 def get_captcha():
-    import random
-    import string
-    from io import BytesIO
-
-    captcha_text = ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
+    """获取验证码（图片或文本）"""
+    captcha_text = _generate_captcha_text()
     session['captcha_text'] = captcha_text
 
     try:
-        from PIL import Image, ImageDraw, ImageFont
-
-        width, height = 120, 40
-        image = Image.new('RGB', (width, height), (17, 29, 50))
-        draw = ImageDraw.Draw(image)
-
-        try:
-            font = ImageFont.truetype("arial.ttf", 28)
-        except Exception:
-            font = ImageFont.load_default()
-
-        for i, char in enumerate(captcha_text):
-            x = 10 + i * 26
-            y = random.randint(2, 8)
-            color = (
-                random.randint(100, 255),
-                random.randint(150, 255),
-                random.randint(200, 255)
-            )
-            draw.text((x, y), char, font=font, fill=color)
-
-        for _ in range(3):
-            x1 = random.randint(0, width)
-            y1 = random.randint(0, height)
-            x2 = random.randint(0, width)
-            y2 = random.randint(0, height)
-            draw.line([(x1, y1), (x2, y2)], fill=(60, 80, 120), width=1)
-
-        for _ in range(30):
-            x = random.randint(0, width)
-            y = random.randint(0, height)
-            draw.point((x, y), fill=(80, 100, 140))
-
-        buffer = BytesIO()
-        image.save(buffer, format='PNG')
-        buffer.seek(0)
-
-        import base64
-        captcha_b64 = base64.b64encode(buffer.read()).decode('utf-8')
-
+        captcha_image_uri = _render_captcha_image(captcha_text)
         return jsonify({
             'code': 200,
             'data': {
-                'captcha': f'data:image/png;base64,{captcha_b64}'
+                'captcha': captcha_image_uri
             }
         })
     except ImportError:
@@ -518,16 +613,14 @@ def change_password():
 
     from auth import hash_password
     try:
-        conn = _get_log_connection()
-        cur = conn.cursor()
-        new_hash = hash_password(new_password)
-        cur.execute(
-            f"UPDATE `{USERS_TABLE}` SET password_hash = %s WHERE id = %s",
-            (new_hash, request.current_user['user_id'])
-        )
-        conn.commit()
-        cur.close()
-        conn.close()
+        with closing(_get_log_connection()) as conn:
+            with closing(conn.cursor()) as cur:
+                new_hash = hash_password(new_password)
+                cur.execute(
+                    f"UPDATE `{USERS_TABLE}` SET password_hash = %s WHERE id = %s",
+                    (new_hash, request.current_user['user_id'])
+                )
+                conn.commit()
         return jsonify({'code': 200, 'message': '密码修改成功'})
     except Exception:
         return jsonify({'code': 500, 'message': '密码修改失败'}), 500
@@ -567,15 +660,13 @@ def upload_avatar():
 
         # 更新用户头像URL
         avatar_url = f"/uploads/avatars/{filename}"
-        conn = _get_log_connection()
-        cur = conn.cursor()
-        cur.execute(
-            f"UPDATE `{USERS_TABLE}` SET avatar = %s WHERE id = %s",
-            (avatar_url, request.current_user['user_id'])
-        )
-        conn.commit()
-        cur.close()
-        conn.close()
+        with closing(_get_log_connection()) as conn:
+            with closing(conn.cursor()) as cur:
+                cur.execute(
+                    f"UPDATE `{USERS_TABLE}` SET avatar = %s WHERE id = %s",
+                    (avatar_url, request.current_user['user_id'])
+                )
+                conn.commit()
 
         return jsonify({
             'code': 200,
@@ -608,15 +699,13 @@ def update_profile():
         return jsonify({'code': 409, 'message': '用户名已存在'}), 409
 
     try:
-        conn = _get_log_connection()
-        cur = conn.cursor()
-        cur.execute(
-            f"UPDATE `{USERS_TABLE}` SET username = %s WHERE id = %s",
-            (username, request.current_user['user_id'])
-        )
-        conn.commit()
-        cur.close()
-        conn.close()
+        with closing(_get_log_connection()) as conn:
+            with closing(conn.cursor()) as cur:
+                cur.execute(
+                    f"UPDATE `{USERS_TABLE}` SET username = %s WHERE id = %s",
+                    (username, request.current_user['user_id'])
+                )
+                conn.commit()
 
         return jsonify({
             'code': 200,
@@ -633,17 +722,15 @@ def update_profile():
 @admin_required
 def get_users():
     try:
-        conn = _get_log_connection()
-        cur = conn.cursor()
-        cur.execute(f"SELECT id, username, role, is_active, created_at, last_login_at FROM `{USERS_TABLE}` ORDER BY id")
-        users = cur.fetchall()
-        for u in users:
-            if u.get('created_at'):
-                u['created_at'] = u['created_at'].strftime('%Y-%m-%d %H:%M:%S')
-            if u.get('last_login_at'):
-                u['last_login_at'] = u['last_login_at'].strftime('%Y-%m-%d %H:%M:%S')
-        cur.close()
-        conn.close()
+        with closing(_get_log_connection()) as conn:
+            with closing(conn.cursor()) as cur:
+                cur.execute(f"SELECT id, username, role, is_active, created_at, last_login_at FROM `{USERS_TABLE}` ORDER BY id")
+                users = cur.fetchall()
+                for user in users:
+                    if user.get('created_at'):
+                        user['created_at'] = user['created_at'].strftime('%Y-%m-%d %H:%M:%S')
+                    if user.get('last_login_at'):
+                        user['last_login_at'] = user['last_login_at'].strftime('%Y-%m-%d %H:%M:%S')
         return jsonify({'code': 200, 'data': {'users': users}})
     except Exception:
         return jsonify({'code': 500, 'message': '查询用户列表失败'}), 500
@@ -653,23 +740,17 @@ def get_users():
 @admin_required
 def toggle_user_active(user_id):
     try:
-        conn = _get_log_connection()
-        cur = conn.cursor()
-        cur.execute(f"SELECT role, is_active FROM `{USERS_TABLE}` WHERE id = %s", (user_id,))
-        user = cur.fetchone()
-        if not user:
-            cur.close()
-            conn.close()
-            return jsonify({'code': 404, 'message': '用户不存在'}), 404
-        if user['role'] == 'admin':
-            cur.close()
-            conn.close()
-            return jsonify({'code': 403, 'message': '不能禁用管理员账户'}), 403
-        new_status = 0 if user['is_active'] else 1
-        cur.execute(f"UPDATE `{USERS_TABLE}` SET is_active = %s WHERE id = %s", (new_status, user_id))
-        conn.commit()
-        cur.close()
-        conn.close()
+        with closing(_get_log_connection()) as conn:
+            with closing(conn.cursor()) as cur:
+                cur.execute(f"SELECT role, is_active FROM `{USERS_TABLE}` WHERE id = %s", (user_id,))
+                user = cur.fetchone()
+                if not user:
+                    return jsonify({'code': 404, 'message': '用户不存在'}), 404
+                if user['role'] == 'admin':
+                    return jsonify({'code': 403, 'message': '不能禁用管理员账户'}), 403
+                new_status = 0 if user['is_active'] else 1
+                cur.execute(f"UPDATE `{USERS_TABLE}` SET is_active = %s WHERE id = %s", (new_status, user_id))
+                conn.commit()
         return jsonify({'code': 200, 'message': '用户状态已更新'})
     except Exception:
         return jsonify({'code': 500, 'message': '操作失败'}), 500
@@ -691,28 +772,24 @@ def get_audit_logs():
         status_filter = request.args.get('status', '')
         limit = min(int(request.args.get('limit', 100)), 500)
 
-        conn = _get_log_connection()
-        cur = conn.cursor()
+        with closing(_get_log_connection()) as conn:
+            with closing(conn.cursor()) as cur:
+                if status_filter:
+                    cur.execute(
+                        f"SELECT * FROM `{AUDIT_LOG_TABLE}` WHERE status = %s ORDER BY created_at DESC LIMIT %s",
+                        (status_filter, limit)
+                    )
+                else:
+                    cur.execute(
+                        f"SELECT * FROM `{AUDIT_LOG_TABLE}` ORDER BY created_at DESC LIMIT %s",
+                        (limit,)
+                    )
 
-        if status_filter:
-            cur.execute(
-                f"SELECT * FROM `{AUDIT_LOG_TABLE}` WHERE status = %s ORDER BY created_at DESC LIMIT %s",
-                (status_filter, limit)
-            )
-        else:
-            cur.execute(
-                f"SELECT * FROM `{AUDIT_LOG_TABLE}` ORDER BY created_at DESC LIMIT %s",
-                (limit,)
-            )
+                logs = cur.fetchall()
+                for log in logs:
+                    if log.get('created_at'):
+                        log['created_at'] = log['created_at'].strftime('%Y-%m-%d %H:%M:%S')
 
-        logs = cur.fetchall()
-        # 转换 datetime 为字符串
-        for log in logs:
-            if log.get('created_at'):
-                log['created_at'] = log['created_at'].strftime('%Y-%m-%d %H:%M:%S')
-
-        cur.close()
-        conn.close()
         return jsonify({"logs": logs})
 
     except Exception as e:
@@ -726,49 +803,14 @@ def fence_metrics():
     返回：总查询数、各状态分布、兜底率、近期趋势
     """
     try:
-        conn = _get_log_connection()
-        cur = conn.cursor()
-
-        # 总体状态分布
-        cur.execute(f"SELECT status, COUNT(*) as cnt FROM `{AUDIT_LOG_TABLE}` GROUP BY status")
-        stats = {row['status']: row['cnt'] for row in cur.fetchall()}
-        total = sum(stats.values())
-
-        # 今日统计
-        cur.execute(
-            f"SELECT status, COUNT(*) as cnt FROM `{AUDIT_LOG_TABLE}` WHERE DATE(created_at) = CURDATE() GROUP BY status"
-        )
-        today_stats = {row['status']: row['cnt'] for row in cur.fetchall()}
-
-        # 高频兜底问题 TOP 10
-        cur.execute(
-            f"SELECT query_text, COUNT(*) as cnt FROM `{AUDIT_LOG_TABLE}` WHERE status = 'fallback' GROUP BY query_text ORDER BY cnt DESC LIMIT 10"
-        )
-        top_fallback = cur.fetchall()
-        for item in top_fallback:
-            item['query_text'] = item['query_text'][:100] if item['query_text'] else ''
-
-        # 澄清问题 TOP 10
-        cur.execute(
-            f"SELECT query_text, COUNT(*) as cnt FROM `{AUDIT_LOG_TABLE}` WHERE status = 'clarify' GROUP BY query_text ORDER BY cnt DESC LIMIT 10"
-        )
-        top_clarify = cur.fetchall()
-        for item in top_clarify:
-            item['query_text'] = item['query_text'][:100] if item['query_text'] else ''
-
-        # 最近 7 天趋势
-        cur.execute(f"""
-            SELECT DATE(created_at) as date, status, COUNT(*) as cnt
-            FROM `{AUDIT_LOG_TABLE}` WHERE created_at >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)
-            GROUP BY DATE(created_at), status ORDER BY date
-        """)
-        trend = cur.fetchall()
-        for item in trend:
-            if item.get('date'):
-                item['date'] = item['date'].strftime('%Y-%m-%d')
-
-        cur.close()
-        conn.close()
+        with closing(_get_log_connection()) as conn:
+            with closing(conn.cursor()) as cur:
+                stats = _query_status_distribution(cur)
+                total = sum(stats.values())
+                today_stats = _query_today_stats(cur)
+                top_fallback = _query_top_fallback(cur)
+                top_clarify = _query_top_clarify(cur)
+                trend = _query_weekly_trend(cur)
 
         return jsonify({
             "total_queries": total,
@@ -793,20 +835,18 @@ def knowledge_gaps():
     返回所有 fallback + clarify 记录，用于管理员标记待补充知识
     """
     try:
-        conn = _get_log_connection()
-        cur = conn.cursor()
-        cur.execute(
-            f"SELECT id, query_text, intent, status, created_at FROM `{AUDIT_LOG_TABLE}` "
-            f"WHERE status IN ('fallback', 'clarify') ORDER BY created_at DESC LIMIT 200"
-        )
-        gaps = cur.fetchall()
-        for item in gaps:
-            if item.get('created_at'):
-                item['created_at'] = item['created_at'].strftime('%Y-%m-%d %H:%M:%S')
-            item['query_text'] = item['query_text'][:200] if item['query_text'] else ''
+        with closing(_get_log_connection()) as conn:
+            with closing(conn.cursor()) as cur:
+                cur.execute(
+                    f"SELECT id, query_text, intent, status, created_at FROM `{AUDIT_LOG_TABLE}` "
+                    f"WHERE status IN ('fallback', 'clarify') ORDER BY created_at DESC LIMIT 200"
+                )
+                gaps = cur.fetchall()
+                for item in gaps:
+                    if item.get('created_at'):
+                        item['created_at'] = item['created_at'].strftime('%Y-%m-%d %H:%M:%S')
+                    item['query_text'] = item['query_text'][:200] if item['query_text'] else ''
 
-        cur.close()
-        conn.close()
         return jsonify({"gaps": gaps})
 
     except Exception as e:
@@ -821,9 +861,7 @@ def knowledge_gaps():
 def dashboard_region_consume():
     """区域消费分析数据 - 按城市聚合"""
     try:
-        conn = _get_log_connection()
-        cur = conn.cursor()
-        cur.execute("""
+        rows = _execute_dashboard_query("""
             SELECT city_name,
                    SUM(total_active_user) as total_active_user,
                    SUM(total_pay_user) as total_pay_user,
@@ -838,14 +876,6 @@ def dashboard_region_consume():
             GROUP BY city_name
             ORDER BY total_sale_amount DESC
         """)
-        rows = cur.fetchall()
-        # 数值类型转float避免序列化问题
-        for row in rows:
-            for k, v in row.items():
-                if hasattr(v, '__float__'):
-                    row[k] = round(float(v), 2)
-        cur.close()
-        conn.close()
         return jsonify({"data": rows})
     except Exception as e:
         return jsonify({"error": f"查询区域消费数据失败: {e}"}), 500
@@ -855,9 +885,7 @@ def dashboard_region_consume():
 def dashboard_product_feature():
     """商品特征数据 - 按品类聚合"""
     try:
-        conn = _get_log_connection()
-        cur = conn.cursor()
-        cur.execute("""
+        rows = _execute_dashboard_query("""
             SELECT product_category,
                    SUM(total_sale_quantity) as total_sale_quantity,
                    SUM(total_sale_amount) as total_sale_amount,
@@ -867,13 +895,6 @@ def dashboard_product_feature():
             GROUP BY product_category
             ORDER BY total_sale_amount DESC
         """)
-        rows = cur.fetchall()
-        for row in rows:
-            for k, v in row.items():
-                if hasattr(v, '__float__'):
-                    row[k] = round(float(v), 2)
-        cur.close()
-        conn.close()
         return jsonify({"data": rows})
     except Exception as e:
         return jsonify({"error": f"查询商品特征数据失败: {e}"}), 500
@@ -883,10 +904,7 @@ def dashboard_product_feature():
 def dashboard_user_profile():
     """用户画像数据 - 按年龄段/性别/城市聚合"""
     try:
-        conn = _get_log_connection()
-        cur = conn.cursor()
-        # 按年龄段聚合
-        cur.execute("""
+        age_data = _execute_dashboard_query("""
             SELECT age_group,
                    COUNT(*) as user_count,
                    AVG(total_consumption) as avg_consumption,
@@ -896,28 +914,14 @@ def dashboard_user_profile():
             GROUP BY age_group
             ORDER BY avg_consumption DESC
         """)
-        age_data = cur.fetchall()
-        for row in age_data:
-            for k, v in row.items():
-                if hasattr(v, '__float__'):
-                    row[k] = round(float(v), 2)
-
-        # 按性别聚合
-        cur.execute("""
+        gender_data = _execute_dashboard_query("""
             SELECT user_gender,
                    COUNT(*) as user_count,
                    AVG(total_consumption) as avg_consumption
             FROM ads_user_profile_full
             GROUP BY user_gender
         """)
-        gender_data = cur.fetchall()
-        for row in gender_data:
-            for k, v in row.items():
-                if hasattr(v, '__float__'):
-                    row[k] = round(float(v), 2)
-
-        # 按城市聚合
-        cur.execute("""
+        city_data = _execute_dashboard_query("""
             SELECT user_city,
                    COUNT(*) as user_count,
                    AVG(total_consumption) as avg_consumption
@@ -925,14 +929,7 @@ def dashboard_user_profile():
             GROUP BY user_city
             ORDER BY avg_consumption DESC
         """)
-        city_data = cur.fetchall()
-        for row in city_data:
-            for k, v in row.items():
-                if hasattr(v, '__float__'):
-                    row[k] = round(float(v), 2)
 
-        cur.close()
-        conn.close()
         return jsonify({
             "data": {
                 "age_data": age_data,
@@ -948,10 +945,7 @@ def dashboard_user_profile():
 def dashboard_interaction():
     """用户-商品交互数据 - 按月份聚合趋势"""
     try:
-        conn = _get_log_connection()
-        cur = conn.cursor()
-        # 按月份聚合交互趋势
-        cur.execute("""
+        trend_data = _execute_dashboard_query("""
             SELECT stat_month,
                    SUM(pv_count) as pv_count,
                    SUM(fav_count) as fav_count,
@@ -962,28 +956,15 @@ def dashboard_interaction():
             GROUP BY stat_month
             ORDER BY stat_month
         """)
-        trend_data = cur.fetchall()
-        for row in trend_data:
-            for k, v in row.items():
-                if hasattr(v, '__float__'):
-                    row[k] = round(float(v), 2)
-
-        # 交互漏斗汇总
-        cur.execute("""
+        funnel_rows = _execute_dashboard_query("""
             SELECT SUM(pv_count) as total_pv,
                    SUM(fav_count) as total_fav,
                    SUM(cart_count) as total_cart,
                    SUM(buy_count) as total_buy
             FROM ads_user_item_interaction_matrix
         """)
-        funnel_data = cur.fetchone()
-        if funnel_data:
-            for k, v in funnel_data.items():
-                if hasattr(v, '__float__'):
-                    funnel_data[k] = round(float(v), 2)
+        funnel_data = funnel_rows[0] if funnel_rows else None
 
-        cur.close()
-        conn.close()
         return jsonify({
             "data": {
                 "trend_data": trend_data,

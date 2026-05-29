@@ -240,6 +240,10 @@ METRIC_TO_COLUMN = {
 # ============================================================
 # 指标同义词归一化映射 —— 扩展用户表达覆盖面
 # ============================================================
+# 归一化策略：
+#   用户输入的指标关键词先通过此字典归一化为标准指标名，
+#   再通过 _resolve_metric_col() 查找对应的SQL字段。
+#   例如：用户说"GMV" → 归一化为"销售额" → 查找 total_sale_amount 字段。
 METRIC_SYNONYMS = {
     # ── 销售额类 → "销售额" ──
     "GMV": "销售额", "gmv": "销售额", "成交额": "销售额",
@@ -368,6 +372,10 @@ PREAGG_TABLE_ROUTE = {
 # ============================================================
 # 交互表查询保护 —— 无精确主键时禁止路由到交互表
 # ============================================================
+# 保护机制：
+#   ads_user_item_interaction_matrix 表需要 user_id 或 product_id 精确主键，
+#   否则全表扫描会拖垮数据库。无精确主键时自动降级到 ais_city_monthly_summary。
+#   判断逻辑在 RAGChatbot._select_table() 中实现。
 INTERACTION_TABLE_GUARD = {
     "table": "ads_user_item_interaction_matrix",
     "required_slots": ["user_id", "product_id"],  # 必须有精确主键
@@ -438,9 +446,14 @@ class SQLExecutor:
     def _resolve_metric_col(self, metric_keyword, schema):
         """
         解析指标对应的SQL字段名。
-        优先使用表级 metric_map，兜底使用全局 METRIC_TO_COLUMN。
-        如果指标在该表不支持，返回 None。
-        
+
+        三级查找流程：
+          L1: 表级不支持列表（unsupported_metrics）→ 命中则返回 None
+          L2: 表级映射（metric_map）→ 命中则返回对应字段
+          L3: 维度映射（dim_map）→ 命中则返回维度字段（is_dim=True）
+          L4: 全局映射兜底（METRIC_TO_COLUMN）→ 命中且字段在表中则返回
+          均未命中 → 返回 (None, False)
+
         返回: (col_name, is_dim) 元组，is_dim=True表示该字段是维度而非指标
         """
         # 先检查表级不支持列表
@@ -470,41 +483,28 @@ class SQLExecutor:
         # 指标在该表不存在
         return None, False
 
-    def _generate_aggregate_sql(self, slots, table, schema, parse_result=None):
+    def _resolve_group_dim(self, slots, table, schema, is_line_chart):
         """
-        生成聚合查询 SQL（GROUP BY + ORDER BY DESC）
-        支持：
-        - 多指标聚合（雷达图场景）
-        - 折线图时间维度（按月排序）
-        - 饼图城市×品类交叉
+        确定聚合查询的分组维度。
+
+        优先级：
+          1. 折线图路径：is_line_chart=True 且表有 stat_month 维度 → 强制 stat_month
+          2. group_by_hint 精确匹配 dims
+          3. group_by_hint 走 DIM_ALIAS_MAP 映射
+          4. 默认取 schema["group_by_dim"]
+
+        返回: group_dim 字符串，或 None（调用方负责降级到标准查询）
         """
-        metric_keyword = slots.get("metric", "销售额")
-        
-        # 🔥 同义词归一化
-        metric_keyword = METRIC_SYNONYMS.get(metric_keyword, metric_keyword)
-
-        # 🔥 特殊路径：交互指标 + 品类聚合 → JOIN 商品表
-        if (table == "ads_user_item_interaction_matrix"
-                and slots.get("group_by_hint") == "product_category"):
-            return self._generate_interaction_category_sql(slots, metric_keyword)
-
-        # 确定分组维度
         group_dim = schema.get("group_by_dim")
-        
-        # 🔥 折线图路径：当 chart_type_hint 包含"折线"或"趋势"且有 stat_month 维度
-        chart_type = slots.get("chart_type_hint", "")
-        is_line_chart = any(kw in chart_type for kw in ["折线", "趋势", "走势", "变化"])
+
         if is_line_chart and "stat_month" in schema.get("dims", []):
-            group_dim = "stat_month"  # 折线图强制按月份分组
-        
-        # 如果 intent_parser 传了 group_by_hint
+            group_dim = "stat_month"
+
         if slots.get("group_by_hint") and not is_line_chart:
             hint = slots["group_by_hint"]
-            # 精确匹配表中的 dims
             if hint in schema.get("dims", []):
                 group_dim = hint
             else:
-                # 🔥 维度名称映射（intent_parser用product_category，但表字段可能不同）
                 DIM_ALIAS_MAP = {
                     "product_category": {
                         "ads_region_consume_analysis": "main_consume_category",
@@ -519,8 +519,95 @@ class SQLExecutor:
                     if mapped_dim in schema.get("dims", []):
                         group_dim = mapped_dim
 
+        return group_dim
+
+    def _build_select_columns(self, all_metrics, group_dim, schema):
+        """
+        构建聚合查询的 SELECT 列。
+
+        逻辑：
+          - 初始列 [{group_dim} as 维度]
+          - 遍历 all_metrics，同义词归一化后调用 _resolve_metric_col
+          - 有效指标：根据 AVG_TYPE_METRICS 选择 SUM/AVG，
+            格式化为 {agg_func}({metric_col}) as {m_normalized}
+
+        返回: (select_cols, valid_metrics) 元组；无有效指标时返回 ([], [])
+        """
+        select_cols = [f"`{group_dim}` as `维度`"]
+        valid_metrics = []
+
+        for m in all_metrics:
+            m_normalized = METRIC_SYNONYMS.get(m, m)
+            metric_col, is_dim = self._resolve_metric_col(m_normalized, schema)
+            if metric_col and not is_dim:
+                agg_func = "AVG" if m_normalized in AVG_TYPE_METRICS else "SUM"
+                select_cols.append(f"{agg_func}(`{metric_col}`) as `{m_normalized}`")
+                valid_metrics.append(m_normalized)
+
+        return select_cols, valid_metrics
+
+    def _build_where_clause(self, slots, schema, group_dim):
+        """
+        构建聚合查询的 WHERE 条件子句。
+
+        逻辑：
+          - 初始 WHERE 1=1
+          - 城市过滤：city 不为空且不为 ALL_CITIES，且表有 city_name 维度
+          - 品类过滤：filter_categories 用 IN，category 用 =，但分组维度是品类时跳过
+          - 多城市筛选：filter_cities 用 IN
+          - 时间过滤：time 格式化后用 LIKE
+
+        返回: (where_sql, params) 元组
+        """
+        sql = "WHERE 1=1"
+        params = []
+
+        if slots.get("city") and slots["city"] != "ALL_CITIES":
+            if "city_name" in schema["dims"]:
+                sql += " AND `city_name` = %s"
+                params.append(slots["city"])
+
+        if slots.get("filter_categories") and "product_category" in schema["dims"]:
+            if group_dim != "product_category":
+                placeholders = ", ".join(["%s"] * len(slots["filter_categories"]))
+                sql += f" AND `product_category` IN ({placeholders})"
+                params.extend(slots["filter_categories"])
+        elif slots.get("category") and "product_category" in schema["dims"]:
+            if group_dim != "product_category":
+                sql += " AND `product_category` = %s"
+                params.append(slots["category"])
+
+        if slots.get("filter_cities") and "city_name" in schema["dims"]:
+            placeholders = ", ".join(["%s"] * len(slots["filter_cities"]))
+            sql += f" AND `city_name` IN ({placeholders})"
+            params.extend(slots["filter_cities"])
+
+        if slots.get("time"):
+            fmt_time = self._format_time(slots["time"])
+            if fmt_time and "stat_month" in schema["dims"]:
+                sql += " AND `stat_month` LIKE %s"
+                params.append(f"{fmt_time}%")
+
+        return sql, params
+
+    def _generate_aggregate_sql(self, slots, table, schema, parse_result=None):
+        """
+        生成聚合查询 SQL（GROUP BY + ORDER BY DESC）。
+        编排方法：依次调用 _resolve_group_dim → _build_select_columns → _build_where_clause，
+        最后拼接 GROUP BY + ORDER BY + LIMIT。
+        """
+        metric_keyword = slots.get("metric", "销售额")
+        metric_keyword = METRIC_SYNONYMS.get(metric_keyword, metric_keyword)
+
+        if (table == "ads_user_item_interaction_matrix"
+                and slots.get("group_by_hint") == "product_category"):
+            return self._generate_interaction_category_sql(slots, metric_keyword)
+
+        chart_type = slots.get("chart_type_hint", "")
+        is_line_chart = any(kw in chart_type for kw in ["折线", "趋势", "走势", "变化"])
+
+        group_dim = self._resolve_group_dim(slots, table, schema, is_line_chart)
         if not group_dim:
-            # 该表不支持聚合查询，退回到常规查询
             from intent_parser import QuestionParseResult
             minimal_pr = QuestionParseResult(
                 intent="sql_query",
@@ -532,74 +619,24 @@ class SQLExecutor:
                 minimal_pr, table, schema
             )
 
-        # 🔥 多指标聚合支持（雷达图场景）
-        extra_metrics = slots.get("extra_metrics", [])
-        all_metrics = [metric_keyword] + extra_metrics
-        
-        # 构建SELECT列
-        select_cols = [f"`{group_dim}` as `维度`"]
-        valid_metrics = []
-        
-        for m in all_metrics:
-            # 同义词归一化
-            m_normalized = METRIC_SYNONYMS.get(m, m)
-            metric_col, is_dim = self._resolve_metric_col(m_normalized, schema)
-            if metric_col and not is_dim:
-                agg_func = "AVG" if m_normalized in AVG_TYPE_METRICS else "SUM"
-                select_cols.append(f"{agg_func}(`{metric_col}`) as `{m_normalized}`")
-                valid_metrics.append(m_normalized)
-        
+        all_metrics = [metric_keyword] + slots.get("extra_metrics", [])
+        select_cols, valid_metrics = self._build_select_columns(all_metrics, group_dim, schema)
         if not valid_metrics:
-            # 没有有效指标 → 返回None标记，让上层走降级
             return None, []
 
-        sql = f"SELECT {', '.join(select_cols)} FROM `{table}` WHERE 1=1"
-        params = []
+        where_sql, params = self._build_where_clause(slots, schema, group_dim)
 
-        # 城市过滤（聚合查询中也可能需要按城市筛选）
-        if slots.get("city") and slots["city"] != "ALL_CITIES":
-            if "city_name" in schema["dims"]:
-                sql += " AND `city_name` = %s"
-                params.append(slots["city"])
-
-        # 品类过滤（当用户提到具体品类时）
-        # 注意：如果分组维度就是品类，则不加品类过滤（否则GROUP BY只有1行，占比/排行无意义）
-        if slots.get("filter_categories") and "product_category" in schema["dims"]:
-            if group_dim != "product_category":
-                placeholders = ", ".join(["%s"] * len(slots["filter_categories"]))
-                sql += f" AND `product_category` IN ({placeholders})"
-                params.extend(slots["filter_categories"])
-        elif slots.get("category") and "product_category" in schema["dims"]:
-            if group_dim != "product_category":
-                sql += " AND `product_category` = %s"
-                params.append(slots["category"])
-
-        # 多城市筛选（如"对比贵阳和遵义"）
-        if slots.get("filter_cities") and "city_name" in schema["dims"]:
-            placeholders = ", ".join(["%s"] * len(slots["filter_cities"]))
-            sql += f" AND `city_name` IN ({placeholders})"
-            params.extend(slots["filter_cities"])
-
-        # 时间过滤（可选）
-        if slots.get("time"):
-            fmt_time = self._format_time(slots["time"])
-            if fmt_time and "stat_month" in schema["dims"]:
-                sql += " AND `stat_month` LIKE %s"
-                params.append(f"{fmt_time}%")
-
-        # GROUP BY
+        sql = f"SELECT {', '.join(select_cols)} FROM `{table}` {where_sql}"
         sql += f" GROUP BY `{group_dim}`"
-        
-        # ORDER BY：折线图按时间升序，其他按主指标降序
+
         if is_line_chart:
-            sql += f" ORDER BY `{group_dim}` ASC"  # 时间升序，折线图必备
+            sql += f" ORDER BY `{group_dim}` ASC"
         else:
-            # 按第一个有效指标降序
             first_metric = valid_metrics[0]
             first_col, _ = self._resolve_metric_col(first_metric, schema)
             agg_func = "AVG" if first_metric in AVG_TYPE_METRICS else "SUM"
             sql += f" ORDER BY {agg_func}(`{first_col}`) DESC"
-        
+
         sql += " LIMIT 20"
         return sql, params
 
