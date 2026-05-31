@@ -29,6 +29,9 @@ from config import (
     KNOWLEDGE_DOCS_DIR, RAG_TOP_K, RAG_CHUNK_SIZE, RAG_CHUNK_OVERLAP, RAG_MAX_DOCUMENTS,
     EMBEDDING_MODEL,
 )
+from data_formatter import StructuredDataFormatter, FormattedData
+from degradation_manager import DegradationStrategyManager, create_degradation_context
+from degradation_strategies import DegradationLevel
 
 # 兜底话术池
 FALLBACK_RESPONSES = [
@@ -166,6 +169,8 @@ class RAGChatbot:
             top_p=0.9
         )
         self._vector_db_loaded = False
+        self._data_formatter = StructuredDataFormatter()
+        self._degradation_manager = DegradationStrategyManager()
 
     # ============================================================
     #  向量数据库管理（基于本地知识文档）
@@ -581,11 +586,16 @@ class RAGChatbot:
         yield "".join(clarify_parts)
 
     # ============================================================
-    #  意图处理：SQL查询（含城市商品兜底、指标全零、四级降级）
+    #  意图处理：SQL查询（重构版：使用格式化器和降级策略管理器）
     # ============================================================
 
     def _handle_sql_query(self, question, parse_result, thinking_text):
-        """处理SQL查询分支：选表→生成SQL→执行→指标全零检测→正常响应/四级降级
+        """处理SQL查询分支：选表→生成SQL→执行→格式化→正常响应/降级策略
+
+        重构要点：
+          1. SQL 结果通过 StructuredDataFormatter 格式化后传给 LLM
+          2. 降级逻辑通过 DegradationStrategyManager 统一管理
+          3. 每个降级策略独立封装，降低嵌套深度
 
         Args:
             question: 用户原始问题
@@ -600,7 +610,6 @@ class RAGChatbot:
         try:
             table_name = self._select_table(parse_result)
 
-            # 城市级商品查询兜底：ais_product_top_ranking 无城市维度
             if slots.get("_city_product_query"):
                 yield from self._handle_city_product_fallback(question, slots, thinking_text)
                 return
@@ -609,7 +618,6 @@ class RAGChatbot:
             thinking_text += f"选择数据表：{table_name}\n正在生成SQL查询语句...\n"
             sql, params = executor.generate_sql(parse_result)
 
-            # sql为None表示指标在该表不支持，尝试备选表
             if sql is None:
                 thinking_text += f"⚠️ 指标 '{slots.get('metric')}' 在表 {table_name} 中不支持\n尝试切换到其他数据表...\n"
                 yield "__THINKING_CONTENT__" + thinking_text
@@ -633,59 +641,20 @@ class RAGChatbot:
             sql_result = executor.execute_sql(sql, params)
 
             if not sql_result.empty:
-                # 指标全零检测与降级切换
                 handled, executor, table_name, thinking_text = yield from self._handle_metric_all_zero(
                     question, slots, sql_result, executor, table_name, thinking_text
                 )
                 if handled:
                     return
 
-                # 正常响应路径
-                thinking_text += f"查询成功，获取到 {len(sql_result)} 条记录 | 🤖 AI 生成回答中...\n"
-                yield "__THINKING_CONTENT__" + thinking_text
-                yield "__THINKING_END__"
-                raw_data = sql_result.to_string(index=False)
-                yield from self._llm_reflect_on_sql_stream(
-                    question, raw_data,
-                    need_chart=slots.get("need_chart", False),
-                    chart_type_hint=slots.get("chart_type_hint")
+                yield from self._handle_successful_query(
+                    question, slots, sql_result, table_name, thinking_text
                 )
-                yield f"\n【数据来源】：\n- {table_name} (SQL查询)"
                 return
             else:
-                # 四级降级策略
-                thinking_text += "精确查询无结果，启动智能降级策略...\n"
-                yield "__THINKING_CONTENT__" + thinking_text
-
-                original_city = slots.get("city", "")
-                is_non_covered = slots.get("_non_covered_city", False)
-
-                # Level 1：去除时间限制
-                if slots.get("time"):
-                    success, thinking_text = yield from self._degrade_level_1_remove_time(
-                        question, slots, executor, table_name, thinking_text
-                    )
-                    if success:
-                        return
-
-                # Level 2：去除城市限制
-                if slots.get("city") and slots["city"] != "ALL_CITIES":
-                    success, thinking_text = yield from self._degrade_level_2_remove_city(
-                        question, slots, executor, table_name, thinking_text,
-                        original_city, is_non_covered
-                    )
-                    if success:
-                        return
-
-                # Level 3：切换AIS预聚合表
-                success, executor, thinking_text = yield from self._degrade_level_3_switch_ais(
-                    question, slots, table_name, is_non_covered, thinking_text, executor
+                yield from self._handle_degradation_flow(
+                    question, slots, executor, table_name, thinking_text, parse_result
                 )
-                if success:
-                    return
-
-                # Level 4：RAG知识库兜底
-                yield from self._degrade_level_4_rag(question, table_name, thinking_text)
                 return
 
         except ValueError as e:
@@ -694,21 +663,139 @@ class RAGChatbot:
             yield from self._rag_stream(question, None, thinking_text, is_fallback=True)
             return
         except Exception as e:
-            error_type = type(e).__name__
-            error_msg = str(e)[:200] if str(e) else "未知错误"
-            thinking_text += f"查询异常：{error_type}: {error_msg}\n"
-            yield "__THINKING_CONTENT__" + thinking_text
-            yield "__THINKING_END__"
-            if "Connection" in error_type or "connect" in error_msg.lower() or "timeout" in error_msg.lower():
-                yield "⚠️ 数据库连接异常，请检查数据库服务是否正常运行。"
-            elif "ValueError" in error_type:
-                yield f"⚠️ 查询配置异常：{error_msg}。请尝试换个方式提问。"
-            else:
-                yield f"⚠️ 查询过程中发生异常，请稍后重试或换个方式提问。"
+            yield from self._handle_query_exception(e, thinking_text)
             return
         finally:
             if executor:
                 executor.close()
+
+    def _handle_successful_query(self, question, slots, sql_result, table_name, thinking_text):
+        """处理成功查询：格式化数据并生成 LLM 回答
+
+        Args:
+            question: 用户原始问题
+            slots: 槽位信息
+            sql_result: SQL 查询结果 DataFrame
+            table_name: 数据表名
+            thinking_text: 思考过程文本
+
+        Yields:
+            str: 思考过程 + 格式化数据 + LLM 回答
+        """
+        thinking_text += f"查询成功，获取到 {len(sql_result)} 条记录 | 🤖 AI 生成回答中...\n"
+        yield "__THINKING_CONTENT__" + thinking_text
+        yield "__THINKING_END__"
+
+        formatted_data = self._data_formatter.format(
+            sql_result, table_name, metric_hint=slots.get("metric")
+        )
+        raw_data = self._data_formatter.to_llm_context(formatted_data)
+
+        yield from self._llm_reflect_on_sql_stream(
+            question, raw_data,
+            need_chart=slots.get("need_chart", False),
+            chart_type_hint=slots.get("chart_type_hint")
+        )
+        yield f"\n【数据来源】：\n- {table_name} (SQL查询)"
+
+    def _handle_degradation_flow(self, question, slots, executor, table_name, thinking_text, parse_result):
+        """处理降级流程：使用策略管理器依次执行降级策略
+
+        Args:
+            question: 用户原始问题
+            slots: 槽位信息
+            executor: SQL 执行器
+            table_name: 数据表名
+            thinking_text: 思考过程文本
+            parse_result: 解析结果
+
+        Yields:
+            str: 思考过程 + 降级结果
+        """
+        thinking_text += "精确查询无结果，启动智能降级策略...\n"
+        yield "__THINKING_CONTENT__" + thinking_text
+
+        context = create_degradation_context(
+            question=question,
+            slots=slots,
+            original_table=table_name,
+            executor=executor,
+            thinking_text=thinking_text,
+            parse_result=parse_result
+        )
+
+        final_result = None
+        for result in self._degradation_manager.execute(context):
+            final_result = result
+            yield "__THINKING_CONTENT__" + result.thinking_text
+
+        if final_result and final_result.success:
+            if final_result.level == DegradationLevel.LEVEL_4_RAG_FALLBACK:
+                yield "__THINKING_END__"
+                yield from self._rag_stream_with_hint(question, None, table_name)
+                if final_result.hint_message:
+                    yield final_result.hint_message
+            else:
+                yield from self._handle_degradation_success(
+                    question, slots, final_result
+                )
+        else:
+            yield "__THINKING_END__"
+            yield "当前数据库中未找到相关数据，请尝试调整查询条件。"
+
+    def _handle_degradation_success(self, question, slots, result):
+        """处理降级成功：格式化数据并生成回答
+
+        Args:
+            question: 用户原始问题
+            slots: 槽位信息
+            result: 降级执行结果
+
+        Yields:
+            str: 思考过程 + 格式化数据 + LLM 回答 + 降级提示
+        """
+        yield "__THINKING_END__"
+
+        if result.sql_result is not None and not result.sql_result.empty:
+            formatted_data = self._data_formatter.format(
+                result.sql_result, result.table_name, metric_hint=slots.get("metric")
+            )
+            raw_data = self._data_formatter.to_llm_context(formatted_data)
+
+            yield from self._llm_reflect_on_sql_stream(
+                question, raw_data,
+                need_chart=slots.get("need_chart", False),
+                chart_type_hint=slots.get("chart_type_hint")
+            )
+
+        if result.hint_message:
+            yield result.hint_message
+
+        if result.table_name:
+            yield f"\n【数据来源】：\n- {result.table_name} (SQL查询，降级级别: {result.level.value})"
+
+    def _handle_query_exception(self, e, thinking_text):
+        """处理查询异常：统一异常处理逻辑
+
+        Args:
+            e: 异常对象
+            thinking_text: 思考过程文本
+
+        Yields:
+            str: 思考过程 + 异常提示
+        """
+        error_type = type(e).__name__
+        error_msg = str(e)[:200] if str(e) else "未知错误"
+        thinking_text += f"查询异常：{error_type}: {error_msg}\n"
+        yield "__THINKING_CONTENT__" + thinking_text
+        yield "__THINKING_END__"
+
+        if "Connection" in error_type or "connect" in error_msg.lower() or "timeout" in error_msg.lower():
+            yield "⚠️ 数据库连接异常，请检查数据库服务是否正常运行。"
+        elif "ValueError" in error_type:
+            yield f"⚠️ 查询配置异常：{error_msg}。请尝试换个方式提问。"
+        else:
+            yield "⚠️ 查询过程中发生异常，请稍后重试或换个方式提问。"
 
     def _handle_city_product_fallback(self, question, slots, thinking_text):
         """城市级商品查询兜底：商品排名表仅支持省级，降级查全省数据并提示
@@ -742,7 +829,10 @@ class RAGChatbot:
             if sql_province is not None:
                 sql_result_province = executor.execute_sql(sql_province, params_province)
                 if not sql_result_province.empty:
-                    raw_data = sql_result_province.to_string(index=False)
+                    formatted_data = self._data_formatter.format(
+                        sql_result_province, "ais_product_top_ranking", metric_hint=slots.get("metric")
+                    )
+                    raw_data = self._data_formatter.to_llm_context(formatted_data)
                     yield from self._llm_reflect_on_sql_stream(question, raw_data, need_chart=False, chart_type_hint=None)
                     yield (f"\n\n⚠️ **温馨提示**：平台数据针对{city_name}的具体商品排名还在更新中，"
                            f"暂时无法提供{city_name}的详细解答。以上为**贵州省全省**的商品排名数据供参考。\n"
@@ -836,7 +926,10 @@ class RAGChatbot:
                         thinking_text += f"  └─ ✅ 切换成功，用'{fallback_metric}'数据分析 | 🤖 AI 生成回答中...\n"
                         yield "__THINKING_CONTENT__" + thinking_text
                         yield "__THINKING_END__"
-                        raw_data = sql_result_fb.to_string(index=False)
+                        formatted_data = self._data_formatter.format(
+                            sql_result_fb, table_name, metric_hint=fallback_metric
+                        )
+                        raw_data = self._data_formatter.to_llm_context(formatted_data)
                         yield from self._llm_reflect_on_sql_stream(
                             question, raw_data,
                             need_chart=slots.get("need_chart", False),
@@ -849,194 +942,6 @@ class RAGChatbot:
             pass
 
         return False, executor, table_name, thinking_text
-
-    # ============================================================
-    #  四级降级策略（查询结果为空时逐级放宽条件）
-    # ============================================================
-
-    def _degrade_level_1_remove_time(self, question, slots, executor, table_name, thinking_text):
-        """降级Level 1：去除时间限制，查询全部历史数据
-
-        当用户指定的时间范围不在数据库覆盖范围内时，移除时间过滤条件重试。
-
-        Returns:
-            tuple: (success, updated_thinking_text)
-            success=True时已yield完整响应（含降级提示）
-        """
-        original_time = slots.get("time", "")
-        thinking_text += "  ├─ Level 1：移除时间限制，查询全部历史数据...\n"
-        yield "__THINKING_CONTENT__" + thinking_text
-
-        slots_without_time = {slot_key: slot_val for slot_key, slot_val in slots.items() if slot_key != "time" and not slot_key.startswith("_")}
-        from intent_parser import QuestionParseResult
-        degraded_pr = QuestionParseResult(
-            intent="sql_query",
-            slots=slots_without_time,
-            original_question=question
-        )
-        try:
-            sql_degraded, params_degraded = executor.generate_sql(degraded_pr)
-            if sql_degraded is not None:
-                sql_result_degraded = executor.execute_sql(sql_degraded, params_degraded)
-                if not sql_result_degraded.empty:
-                    thinking_text += "  └─ ✅ Level 1 降级成功 | 🤖 AI 生成回答中...\n"
-                    yield "__THINKING_CONTENT__" + thinking_text
-                    yield "__THINKING_END__"
-                    raw_data = sql_result_degraded.to_string(index=False)
-                    yield from self._llm_reflect_on_sql_stream(
-                        question, raw_data,
-                        need_chart=slots.get("need_chart", False),
-                        chart_type_hint=slots.get("chart_type_hint")
-                    )
-                    time_hint = f"您指定的时间「{original_time}」不在数据库覆盖范围内" if original_time else "指定时间范围内无数据"
-                    yield (f"\n\n💡 **降级提示（Level 1 - 去除时间限制）**：{time_hint}，"
-                           f"已自动查询全部历史数据。数据库当前覆盖时间为**2025年1-12月**。")
-                    yield f"\n【数据来源】：\n- {table_name} (SQL查询，降级: 去除时间→全时间范围)"
-                    return True, thinking_text
-        except Exception:
-            pass
-
-        return False, thinking_text
-
-    def _degrade_level_2_remove_city(self, question, slots, executor, table_name, thinking_text,
-                                      original_city, is_non_covered):
-        """降级Level 2：去除城市限制，查询全省聚合数据
-
-        当指定城市在数据表中无匹配记录时，移除城市过滤条件，查询全省汇总数据。
-
-        Args:
-            original_city: 用户原始查询的城市名
-            is_non_covered: 城市是否不在系统覆盖范围内（9市州之外）
-
-        Returns:
-            tuple: (success, updated_thinking_text)
-        """
-        thinking_text += "  ├─ Level 2：移除城市限制，查询全省聚合数据...\n"
-        yield "__THINKING_CONTENT__" + thinking_text
-
-        slots_province_aggregate = {slot_key: slot_val for slot_key, slot_val in slots.items()
-                         if slot_key != "time" and slot_key != "city" and not slot_key.startswith("_")}
-        slots_province_aggregate["city"] = "ALL_CITIES"
-        slots_province_aggregate["is_aggregate"] = True
-        from intent_parser import QuestionParseResult
-        degraded_pr = QuestionParseResult(
-            intent="sql_query",
-            slots=slots_province_aggregate,
-            original_question=question
-        )
-        try:
-            sql_degraded, params_degraded = executor.generate_sql(degraded_pr)
-            if sql_degraded is not None:
-                sql_result_degraded = executor.execute_sql(sql_degraded, params_degraded)
-                if not sql_result_degraded.empty:
-                    thinking_text += "  └─ ✅ Level 2 降级成功 | 🤖 AI 生成回答中...\n"
-                    yield "__THINKING_CONTENT__" + thinking_text
-                    yield "__THINKING_END__"
-                    raw_data = sql_result_degraded.to_string(index=False)
-                    yield from self._llm_reflect_on_sql_stream(
-                        question, raw_data,
-                        need_chart=slots.get("need_chart", False),
-                        chart_type_hint=slots.get("chart_type_hint")
-                    )
-                    if is_non_covered:
-                        city_display = original_city
-                        yield (f"\n\n💡 **降级提示（Level 2 - 去除城市限制）**："
-                               f"您查询的地区「{city_display}」不在系统覆盖范围内，"
-                               f"当前系统仅覆盖**贵州省9个市州**（贵阳、遵义、六盘水、毕节、铜仁、安顺、黔东南、黔南、黔西南）。"
-                               f"已为您展示**贵州省整体数据**作为参考。")
-                    else:
-                        city_display = original_city.replace("市", "").replace("州", "")
-                        yield (f"\n\n💡 **降级提示（Level 2 - 去除城市限制）**："
-                               f"「{city_display}」在当前数据表中未找到匹配记录，"
-                               f"已为您展示**贵州省整体数据**作为参考。"
-                               f"如需查看具体城市数据，可尝试：\"贵阳的销售额\"、\"遵义的消费趋势\"")
-                    yield f"\n【数据来源】：\n- {table_name} (SQL查询，降级: 去除城市→全省汇总)"
-                    return True, thinking_text
-        except Exception:
-            pass
-
-        return False, thinking_text
-
-    def _degrade_level_3_switch_ais(self, question, slots, table_name, is_non_covered, thinking_text, executor):
-        """降级Level 3：切换到AIS预聚合表查询
-
-        根据问题关键词和已有槽位信息，智能选择最合适的AIS层预聚合表：
-        - 有品类意图 → ais_category_monthly_summary 或 ais_city_category_summary
-        - 有趋势/月度意图 → ais_city_monthly_summary
-        - 有城市但无上述意图 → ais_city_monthly_summary
-        - 兜底 → ais_category_monthly_summary
-
-        Args:
-            executor: 当前SQL执行器（将被替换为AIS表的执行器）
-
-        Returns:
-            tuple: (success, updated_executor, updated_thinking_text)
-        """
-        thinking_text += "  ├─ Level 3：切换到AIS预聚合表查询...\n"
-        yield "__THINKING_CONTENT__" + thinking_text
-
-        metric = slots.get("metric", "销售额")
-        ais_table = None
-        if slots.get("category") or any(keyword in question for keyword in ["品类", "类型", "结构"]):
-            if slots.get("city") and slots["city"] != "ALL_CITIES" and not is_non_covered:
-                ais_table = "ais_city_category_summary"
-            else:
-                ais_table = "ais_category_monthly_summary"
-        elif any(keyword in question for keyword in ["趋势", "月度", "走势", "按月"]):
-            ais_table = "ais_city_monthly_summary"
-        elif slots.get("city") and slots["city"] != "ALL_CITIES" and not is_non_covered:
-            ais_table = "ais_city_monthly_summary"
-        else:
-            ais_table = "ais_category_monthly_summary"
-
-        if ais_table and ais_table != table_name:
-            try:
-                executor.close()
-                executor = SQLExecutor(table_name=ais_table)
-                slots_ais_degraded = {slot_key: slot_val for slot_key, slot_val in slots.items() if slot_key != "time" and not slot_key.startswith("_")}
-                if is_non_covered:
-                    slots_ais_degraded["city"] = "ALL_CITIES"
-                    slots_ais_degraded["is_aggregate"] = True
-                from intent_parser import QuestionParseResult
-                ais_degraded_result = QuestionParseResult(
-                    intent="sql_query",
-                    slots=slots_ais_degraded,
-                    original_question=question
-                )
-                sql_ais, params_ais = executor.generate_sql(ais_degraded_result)
-                if sql_ais is not None:
-                    sql_result_ais = executor.execute_sql(sql_ais, params_ais)
-                    if not sql_result_ais.empty:
-                        thinking_text += f"  └─ ✅ Level 3 降级成功，获取到 {len(sql_result_ais)} 条记录 | 🤖 AI 生成回答中...\n"
-                        yield "__THINKING_CONTENT__" + thinking_text
-                        yield "__THINKING_END__"
-                        raw_data = sql_result_ais.to_string(index=False)
-                        yield from self._llm_reflect_on_sql_stream(
-                            question, raw_data,
-                            need_chart=slots.get("need_chart", False),
-                            chart_type_hint=slots.get("chart_type_hint")
-                        )
-                        yield (f"\n\n💡 **降级提示（Level 3 - 切换预聚合表）**："
-                               f"原表（{table_name}）数据不足，已自动切换到预聚合表（{ais_table}）查询。"
-                               f"数据粒度可能有所调整，但能为您提供宏观参考。")
-                        yield f"\n【数据来源】：\n- {ais_table} (AIS预聚合表，降级: {table_name}→{ais_table})"
-                        return True, executor, thinking_text
-            except Exception:
-                pass
-
-        return False, executor, thinking_text
-
-    def _degrade_level_4_rag(self, question, table_name, thinking_text):
-        """降级Level 4：前三级结构化查询均无匹配，切换RAG知识库兜底
-
-        Args:
-            table_name: 之前尝试的表名（用于提示信息）
-            thinking_text: 已累积的思考过程文本
-        """
-        thinking_text += "  ├─ Level 4：结构化数据全部无匹配，切换RAG知识库检索...\n"
-        yield "__THINKING_CONTENT__" + thinking_text
-        yield "__THINKING_END__"
-        yield from self._rag_stream_with_hint(question, None, table_name)
 
     # ============================================================
     #  RAG 检索流
